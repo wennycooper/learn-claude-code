@@ -1,30 +1,26 @@
 #!/usr/bin/env python3
-# Harness: planning -- Azure OpenAI GPT-4o version
+# Harness: context isolation -- Azure OpenAI GPT-4o version
 """
-aoai_s03_todo_write.py - TodoWrite (Azure OpenAI Version)
+aoai_s04_subagent.py - Subagents (Azure OpenAI Version)
 
-The model tracks its own progress via a TodoManager. A nag reminder
-forces it to keep updating when it forgets.
+Spawn a child agent with fresh messages=[]. The child works in its own
+context, sharing the filesystem, then returns only a summary to the parent.
 
-    +----------+      +-------+      +---------+
-    |   User   | ---> |  LLM  | ---> | Tools   |
-    |  prompt  |      |       |      | + todo  |
-    +----------+      +---+---+      +----+----+
-                          ^               |
-                          |   tool_result |
-                          +---------------+
-                                |
-                    +-----------+-----------+
-                    | TodoManager state     |
-                    | [ ] task A            |
-                    | [>] task B <- doing   |
-                    | [x] task C            |
-                    +-----------------------+
-                                |
-                    if rounds_since_todo >= 3:
-                      inject <reminder>
+    Parent agent                     Subagent
+    +------------------+             +------------------+
+    | messages=[...]   |             | messages=[]      |  <-- fresh
+    |                  |  dispatch   |                  |
+    | tool: task       | ---------->| while tool_calls: |
+    |   prompt="..."   |            |   call tools     |
+    |   description="" |            |   append results |
+    |                  |  summary   |                  |
+    |   result = "..." | <--------- | return last text |
+    +------------------+             +------------------+
+              |
+    Parent context stays clean.
+    Subagent context is discarded.
 
-Key insight: "The agent can track its own progress -- and I can see it."
+Key insight: "Process isolation gives context isolation for free."
 """
 
 import os
@@ -47,55 +43,18 @@ client = AzureOpenAI(
 WORKDIR = Path.cwd()
 MODEL = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4o")
 
-SYSTEM = f"""You are a coding agent at {WORKDIR}.
+SYSTEM = f"""You are a coding agent at {WORKDIR}. Use the task tool to delegate exploration or subtasks.
 Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.
 IMPORTANT: Every time you call the todo tool, you MUST include ALL tasks in the list, not just the current one. Never pass a partial list — always pass the complete set of tasks with their latest statuses.
 Before executing commands, briefly explain what you plan to do and why.
 Think step by step and communicate your reasoning."""
 
-
-# -- TodoManager: structured state the LLM writes to --
-class TodoManager:
-    def __init__(self):
-        self.items = []
-
-    def update(self, items: list) -> str:
-        if len(items) > 20:
-            raise ValueError("Max 20 todos allowed")
-        validated = []
-        in_progress_count = 0
-        for i, item in enumerate(items):
-            text = str(item.get("text", "")).strip()
-            status = str(item.get("status", "pending")).lower()
-            item_id = str(item.get("id", str(i + 1)))
-            if not text:
-                raise ValueError(f"Item {item_id}: text required")
-            if status not in ("pending", "in_progress", "completed"):
-                raise ValueError(f"Item {item_id}: invalid status '{status}'")
-            if status == "in_progress":
-                in_progress_count += 1
-            validated.append({"id": item_id, "text": text, "status": status})
-        if in_progress_count > 1:
-            raise ValueError("Only one task can be in_progress at a time")
-        self.items = validated
-        return self.render()
-
-    def render(self) -> str:
-        if not self.items:
-            return "No todos."
-        lines = []
-        for item in self.items:
-            marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}[item["status"]]
-            lines.append(f"{marker} #{item['id']}: {item['text']}")
-        done = sum(1 for t in self.items if t["status"] == "completed")
-        lines.append(f"\n({done}/{len(self.items)} completed)")
-        return "\n".join(lines)
+SUBAGENT_SYSTEM = f"""You are a coding subagent at {WORKDIR}. Complete the given task, then summarize your findings.
+Before executing commands, briefly explain what you plan to do and why.
+Think step by step and communicate your reasoning."""
 
 
-TODO = TodoManager()
-
-
-# -- Tool implementations --
+# -- Tool implementations shared by parent and child --
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
@@ -144,6 +103,46 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Error: {e}"
 
 
+# -- TodoManager: structured state the LLM writes to --
+class TodoManager:
+    def __init__(self):
+        self.items = []
+
+    def update(self, items: list) -> str:
+        if len(items) > 20:
+            raise ValueError("Max 20 todos allowed")
+        validated = []
+        in_progress_count = 0
+        for i, item in enumerate(items):
+            text = str(item.get("text", "")).strip()
+            status = str(item.get("status", "pending")).lower()
+            item_id = str(item.get("id", str(i + 1)))
+            if not text:
+                raise ValueError(f"Item {item_id}: text required")
+            if status not in ("pending", "in_progress", "completed"):
+                raise ValueError(f"Item {item_id}: invalid status '{status}'")
+            if status == "in_progress":
+                in_progress_count += 1
+            validated.append({"id": item_id, "text": text, "status": status})
+        if in_progress_count > 1:
+            raise ValueError("Only one task can be in_progress at a time")
+        self.items = validated
+        return self.render()
+
+    def render(self) -> str:
+        if not self.items:
+            return "No todos."
+        lines = []
+        for item in self.items:
+            marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}[item["status"]]
+            lines.append(f"{marker} #{item['id']}: {item['text']}")
+        done = sum(1 for t in self.items if t["status"] == "completed")
+        lines.append(f"\n({done}/{len(self.items)} completed)")
+        return "\n".join(lines)
+
+
+TODO = TodoManager()
+
 TOOL_HANDLERS = {
     "bash":       lambda **kw: run_bash(kw["command"]),
     "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
@@ -152,8 +151,8 @@ TOOL_HANDLERS = {
     "todo":       lambda **kw: TODO.update(kw["items"]),
 }
 
-# Azure OpenAI uses function calling format
-TOOLS = [
+# Child gets all base tools except task (no recursive spawning)
+CHILD_TOOLS = [
     {
         "type": "function",
         "function": {
@@ -212,6 +211,70 @@ TOOLS = [
             }
         }
     },
+]
+
+
+# -- Subagent: fresh context, filtered tools, summary-only return --
+def run_subagent(prompt: str) -> str:
+    sub_messages = [{"role": "user", "content": prompt}]  # fresh context
+    response = None
+    for _ in range(30):  # safety limit
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "system", "content": SUBAGENT_SYSTEM}] + sub_messages,
+            tools=CHILD_TOOLS,
+            max_tokens=4000,
+        )
+        msg = response.choices[0].message
+        sub_messages.append({
+            "role": "assistant",
+            "content": msg.content,
+            "tool_calls": msg.tool_calls
+        })
+        if msg.content:
+            print(f"  \033[34m[subagent] {msg.content}\033[0m")
+        if not msg.tool_calls:
+            break
+        # Append tool results (must immediately follow assistant tool_calls)
+        for block in msg.tool_calls:
+            function_args = json.loads(block.function.arguments)
+            handler = TOOL_HANDLERS.get(block.function.name)
+            try:
+                output = handler(**function_args) if handler else f"Unknown tool: {block.function.name}"
+            except Exception as e:
+                output = f"Error: {e}"
+            if block.function.name == "bash":
+                print(f"  \033[33m[subagent] $ {function_args['command']}\033[0m")
+            print(f"  [subagent] > {block.function.name}: {str(output)[:200]}")
+            sub_messages.append({
+                "role": "tool",
+                "tool_call_id": block.id,
+                "name": block.function.name,
+                "content": str(output)[:50000]
+            })
+    # Only the final text returns to the parent -- child context is discarded
+    if response:
+        return response.choices[0].message.content or "(no summary)"
+    return "(no summary)"
+
+
+# -- Parent tools: base tools + task dispatcher + todo --
+PARENT_TOOLS = CHILD_TOOLS + [
+    {
+        "type": "function",
+        "function": {
+            "name": "task",
+            "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string", "description": "The task for the subagent to complete"},
+                    "description": {"type": "string", "description": "Short description of the task"}
+                },
+                "required": ["prompt"]
+            }
+        }
+    },
     {
         "type": "function",
         "function": {
@@ -222,7 +285,7 @@ TOOLS = [
                 "properties": {
                     "items": {
                         "type": "array",
-                        "description": "List of todo items",
+                        "description": "Complete list of ALL todo items (never partial)",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -241,61 +304,63 @@ TOOLS = [
                 "required": ["items"]
             }
         }
-    }
+    },
 ]
 
 
-# -- Agent loop with nag reminder injection --
 def agent_loop(messages: list):
     rounds_since_todo = 0
     while True:
-        # Nag reminder is injected below, alongside tool results
         response = client.chat.completions.create(
             model=MODEL,
             messages=[{"role": "system", "content": SYSTEM}] + messages,
-            tools=TOOLS,
+            tools=PARENT_TOOLS,
             max_tokens=4000,
         )
-        # Append assistant turn
+        msg = response.choices[0].message
         messages.append({
             "role": "assistant",
-            "content": response.choices[0].message.content,
-            "tool_calls": response.choices[0].message.tool_calls
+            "content": msg.content,
+            "tool_calls": msg.tool_calls
         })
-        # Print assistant's explanation if present
-        if response.choices[0].message.content:
-            print(f"\033[32m{response.choices[0].message.content}\033[0m")
+        if msg.content:
+            print(f"\033[32m{msg.content}\033[0m")
             print()
-        # If the model didn't call a tool, we're done
-        if not response.choices[0].message.tool_calls:
+        if not msg.tool_calls:
             return
-        # Execute each tool call, collect results
+        # Execute each tool call, collect results (must follow assistant tool_calls immediately)
         results = []
         used_todo = False
-        for block in response.choices[0].message.tool_calls:
+        for block in msg.tool_calls:
             function_args = json.loads(block.function.arguments)
-            handler = TOOL_HANDLERS.get(block.function.name)
-            try:
-                output = handler(**function_args) if handler else f"Unknown tool: {block.function.name}"
-            except Exception as e:
-                output = f"Error: {e}"
-            # Print tool output (special formatting for todo)
+            if block.function.name == "task":
+                desc = function_args.get("description", "subtask")
+                print(f"> task ({desc}): {function_args['prompt'][:80]}")
+                output = run_subagent(function_args["prompt"])
+            else:
+                if block.function.name == "bash":
+                    print(f"\033[33m$ {function_args['command']}\033[0m")
+                handler = TOOL_HANDLERS.get(block.function.name)
+                try:
+                    output = handler(**function_args) if handler else f"Unknown tool: {block.function.name}"
+                except Exception as e:
+                    output = f"Error: {e}"
             if block.function.name == "todo":
-                print(f"> {block.function.name}:\n{str(output)}")
+                print(f"> todo:\n{str(output)}")
                 used_todo = True
             else:
-                print(f"> {block.function.name}: {str(output)[:200]}")
+                print(f"  {str(output)[:200]}")
             results.append({
                 "role": "tool",
                 "tool_call_id": block.id,
                 "name": block.function.name,
                 "content": str(output)
             })
-        rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
-        # Append all tool results as separate messages (must follow assistant tool_calls immediately)
+        # Append tool results first (must immediately follow assistant tool_calls)
         for result in results:
             messages.append(result)
-        # Inject nag reminder after tool results, as a new user message
+        # Nag reminder after tool results
+        rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
         if rounds_since_todo >= 3:
             messages.append({
                 "role": "user",
@@ -305,12 +370,12 @@ def agent_loop(messages: list):
 
 if __name__ == "__main__":
     history = []
-    print("\033[32mAzure OpenAI GPT-4o Agent with TodoWrite\033[0m")
+    print("\033[32mAzure OpenAI GPT-4o Agent with Subagents\033[0m")
     print("Type 'q', 'exit', or press Ctrl+C to quit\n")
 
     while True:
         try:
-            query = input("\033[36maoai-s03 >> \033[0m")
+            query = input("\033[36maoai-s04 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             print("\nBye!")
             break
