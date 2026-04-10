@@ -327,6 +327,14 @@ def agent_loop(messages: list):
             print(f"\033[32m{msg.content}\033[0m")
             print()
         if not msg.tool_calls:
+            # If there are incomplete todos, force one more round to update them
+            incomplete = [t for t in TODO.items if t["status"] != "completed"]
+            if incomplete:
+                messages.append({
+                    "role": "user",
+                    "content": "<reminder>Update your todos — mark all completed tasks before finishing.</reminder>"
+                })
+                continue
             return
         # Execute each tool call, collect results (must follow assistant tool_calls immediately)
         results = []
