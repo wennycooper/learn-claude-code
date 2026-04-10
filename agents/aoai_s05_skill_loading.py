@@ -340,8 +340,15 @@ def agent_loop(messages: list):
         if response.choices[0].message.content:
             print(f"\033[32m{response.choices[0].message.content}\033[0m")
             print()
-        # If the model didn't call a tool, we're done
+        # If the model didn't call a tool, check for incomplete todos before stopping
         if not response.choices[0].message.tool_calls:
+            incomplete = [t for t in TODO.items if t["status"] != "completed"]
+            if incomplete:
+                messages.append({
+                    "role": "user",
+                    "content": "<reminder>Update your todos — mark all completed tasks before finishing.</reminder>"
+                })
+                continue
             return
         # Execute each tool call, collect results
         results = []
@@ -358,6 +365,8 @@ def agent_loop(messages: list):
                 print(f"> {block.function.name}:\n{str(output)}")
                 used_todo = True
             else:
+                if block.function.name == "bash":
+                    print(f"\033[33m$ {function_args['command']}\033[0m")
                 print(f"> {block.function.name}: {str(output)[:200]}")
             results.append({
                 "role": "tool",
