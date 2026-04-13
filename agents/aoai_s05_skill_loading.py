@@ -81,11 +81,13 @@ class SkillLoader:
         match = re.match(r"^---\n(.*?)\n---\n(.*)", text, re.DOTALL)
         if not match:
             return {}, text
-        meta = {}
-        for line in match.group(1).strip().splitlines():
-            if ":" in line:
-                key, val = line.split(":", 1)
-                meta[key.strip()] = val.strip()
+        import yaml
+        try:
+            meta = yaml.safe_load(match.group(1)) or {}
+            if not isinstance(meta, dict):
+                meta = {}
+        except yaml.YAMLError:
+            meta = {}
         return meta, match.group(2).strip()
 
     def get_descriptions(self) -> str:
