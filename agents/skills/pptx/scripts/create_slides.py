@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-create_slides.py - Create a .pptx from a JSON content file with Unsplash images.
+create_slides.py - Create a .pptx from a JSON content file with Google Images (via SerpAPI).
 
 Usage:
     python skills/pptx/scripts/create_slides.py content.json --out output.pptx
@@ -14,14 +14,14 @@ JSON format:
             {
                 "title": "Slide Title",
                 "bullets": ["Point 1", "Point 2", "Point 3"],
-                "image_keyword": "robot arm factory",
+                "image_keyword": "鄭麗文習近平握手會面",
                 "notes": "Optional speaker notes"
             }
         ]
     }
 
-Requirements: pip install python-pptx requests
-              UNSPLASH_ACCESS_KEY in .env
+Requirements: pip install python-pptx
+              SERP_API_KEY in .env
 """
 
 import argparse
@@ -57,33 +57,78 @@ def load_env():
             break
 
 
-def fetch_unsplash(query: str) -> tuple[bytes, str]:
-    """Return (image_bytes, credit_string). Falls back gracefully if no key."""
-    access_key = os.environ.get("UNSPLASH_ACCESS_KEY", "")
-    if not access_key:
-        print(f"  [skip image] UNSPLASH_ACCESS_KEY not set", file=sys.stderr)
+def _to_jpeg(img_bytes: bytes) -> bytes | None:
+    """Convert image bytes to JPEG. Handles WEBP and other formats via Pillow."""
+    # Detect WEBP: starts with RIFF....WEBP
+    is_webp = img_bytes[:4] == b'RIFF' and img_bytes[8:12] == b'WEBP'
+    # Detect non-JPEG/PNG by checking magic bytes
+    is_jpeg = img_bytes[:2] == b'\xff\xd8'
+    is_png  = img_bytes[:8] == b'\x89PNG\r\n\x1a\n'
+    if is_jpeg or is_png:
+        return img_bytes  # already supported, no conversion needed
+    try:
+        from PIL import Image
+        import io
+        img = Image.open(io.BytesIO(img_bytes))
+        out = io.BytesIO()
+        img.convert('RGB').save(out, format='JPEG', quality=85)
+        converted = out.getvalue()
+        if is_webp:
+            print(f"  [webp→jpeg converted]")
+        return converted
+    except Exception as e:
+        print(f"  [convert error] {e}", file=sys.stderr)
+        return None
+
+
+def fetch_image(query: str) -> tuple[bytes, str]:
+    """Return (image_bytes, credit_string) using SerpAPI Google Images."""
+    api_key = os.environ.get("SERP_API_KEY", "")
+    if not api_key:
+        print(f"  [skip image] SERP_API_KEY not set", file=sys.stderr)
         return None, ""
 
     params = urllib.parse.urlencode({
-        "query": query, "per_page": 1, "orientation": "landscape"
+        "engine": "google_images",
+        "q": query,
+        "api_key": api_key,
+        "num": 5,
+        "safe": "active",
     })
     req = urllib.request.Request(
-        f"https://api.unsplash.com/search/photos?{params}",
-        headers={"Authorization": f"Client-ID {access_key}", "Accept-Version": "v1"}
+        f"https://serpapi.com/search.json?{params}",
+        headers={"User-Agent": "Mozilla/5.0"}
     )
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read())
-        results = data.get("results", [])
+        results = data.get("images_results", [])
         if not results:
             print(f"  [no image] no results for '{query}'", file=sys.stderr)
             return None, ""
-        photo = results[0]
-        img_url = photo["urls"]["regular"]
-        credit = f"Photo by {photo['user']['name']} on Unsplash"
-        print(f"  [image] '{query}' → {credit}")
-        with urllib.request.urlopen(img_url, timeout=15) as r:
-            return r.read(), credit
+        # Try each result until one downloads and converts successfully
+        for photo in results[:8]:
+            img_url = photo.get("original") or photo.get("thumbnail", "")
+            if not img_url:
+                continue
+            source = photo.get("source", "Google Images")
+            credit = f"via Google / {source}"
+            try:
+                img_req = urllib.request.Request(
+                    img_url, headers={"User-Agent": "Mozilla/5.0"}
+                )
+                with urllib.request.urlopen(img_req, timeout=15) as r:
+                    raw = r.read()
+                if len(raw) < 1000:
+                    continue
+                img_bytes = _to_jpeg(raw)
+                if img_bytes:
+                    print(f"  [image] '{query}' → {credit}")
+                    return img_bytes, credit
+            except Exception:
+                continue
+        print(f"  [no image] all downloads failed for '{query}'", file=sys.stderr)
+        return None, ""
     except Exception as e:
         print(f"  [image error] {e}", file=sys.stderr)
         return None, ""
@@ -234,16 +279,20 @@ def main():
     subtitle = data.get("subtitle", "")
     kw       = data.get("image_keyword", title)
     print(f"[title slide] '{title}'")
-    img, credit = fetch_unsplash(kw)
+    img, credit = fetch_image(kw)
     add_title_slide(prs, title, subtitle, accent, img, credit)
 
-    # Content slides
-    for i, slide_data in enumerate(data.get("slides", []), 1):
+    # Content slides — accept both "slides" and "content" as key
+    slide_list = data.get("slides") or data.get("content") or []
+    if not slide_list:
+        print("ERROR: JSON has no 'slides' array. Add a 'slides' key with a list of slide objects.", file=sys.stderr)
+        sys.exit(1)
+    for i, slide_data in enumerate(slide_list, 1):
         stitle   = slide_data.get("title", f"Slide {i}")
         bullets  = slide_data.get("bullets", [])
         keyword  = slide_data.get("image_keyword", stitle)
         print(f"[slide {i}] '{stitle}' — searching '{keyword}'")
-        img, credit = fetch_unsplash(keyword)
+        img, credit = fetch_image(keyword)
         add_content_slide(prs, stitle, bullets, accent, img, credit)
 
     out_path = Path(args.out)

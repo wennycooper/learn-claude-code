@@ -26,6 +26,8 @@ import os
 import re
 import subprocess
 import time
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 from openai import AzureOpenAI
@@ -42,7 +44,7 @@ load_dotenv(override=True)
 client = AzureOpenAI(
     azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
     api_key=os.getenv("AZURE_OPENAI_API_KEY"),
-    api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
+    api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2025-01-01-preview")
 )
 
 WORKDIR = Path.cwd()
@@ -51,7 +53,7 @@ SKILLS_DIR = WORKDIR / "skills"
 
 THRESHOLD = 50000
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
-KEEP_RECENT = 3
+KEEP_RECENT = 6
 
 
 # ── SkillLoader ────────────────────────────────────────────────────────────────
@@ -147,33 +149,71 @@ TODO = TodoManager()
 SYSTEM = f"""You are a coding agent at {WORKDIR}.
 
 PDF reading strategy:
-  1. Call get_pdf_info first to know total pages.
-  2. Call read_pdf_pages with a small range (e.g. "1-5") to see table of contents.
-  3. Jump directly to relevant sections — do NOT read every page sequentially.
-  4. Repeat read_pdf_pages on specific pages as needed until you can answer.
+  1. If given a directory path, run bash("ls <dir>") first to find the PDF filename.
+  2. Call load_skill("pdf-reading") FIRST before reading any PDF — it contains all rules.
+  3. Call get_pdf_info to know total pages.
+  4. Call read_pdf_pages to find the Table of Contents — read pages 1-15 for large PDFs (100+ pages), 1-5 for small ones.
+  5. Jump directly to relevant sections — do NOT read every page sequentially.
+  6. Always read past the end of a section to confirm completeness.
   Note: read_pdf_pages returns extracted text, not images.
 
-PAGE OFFSET WARNING (critical):
-  After reading any page, ALWAYS check the printed page number in the header or footer
-  of the returned text. It may differ from the physical page number you requested.
-  Example: you request page 151, but the footer shows "- 141 -" or "141".
-  This means offset = 151 - 141 = 10. To reach printed page N, use physical page N + offset.
-  If you detect a mismatch, call load_skill("pdf-page-offset") for the full procedure.
-  DO NOT assume the page you read is the printed page you wanted — always verify.
+PAGE NAVIGATION (always apply):
+  Physical page ≠ printed page. NEVER assume they match. Navigate dynamically:
+    1. TOC says target at printed p.N → read ONE physical page (just p.N) as first guess.
+    2. After reading, EXPLICITLY state: "The printed page number on this page is: X"
+       (look for it at the top or bottom of the extracted text, e.g. "54", "- 54 -")
+    3. If printed X < N: jump forward to physical N + (N - X)
+       If printed X > N: jump backward to physical N - (X - N)
+       If printed X = N: you found the right page ✓
+    4. Repeat reading ONE page at a time until printed number matches N.
+  NEVER read a range of pages (e.g. 64-67) during navigation — always ONE page at a time
+  so you can clearly identify the printed page number.
 
 Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.
 IMPORTANT: Every time you call the todo tool, you MUST include ALL tasks in the list, not just the current one.
+NEVER mark a task as completed if it returned an error or was skipped — fix the error first.
 Use load_skill to access specialized knowledge before tackling unfamiliar topics.
 Use the task tool to delegate subtasks to subagents with fresh context.
 Before executing commands, briefly explain what you plan to do and why.
 Think step by step and communicate your reasoning.
+
+PRESENTATION (PPTX) RULES — follow exactly when asked to make slides:
+  1. Call load_skill("pptx") FIRST — read the keyword guide before picking image_keyword values.
+  2. Use write_file to create a JSON content file (e.g. slides_content.json) with:
+     - A meaningful "title" (NOT "Presentation")
+     - The slides array key MUST be "slides" (not "content", not "pages") — e.g. {{"title": "...", "slides": [...]}}
+     - At least 18-20 items in the "slides" array, each with 3-5 bullets (user expects a full, rich presentation)
+     - "image_keyword" should be specific: use real names, places, or events (Chinese OK, e.g. "鄭麗文習近平握手")
+  3. Run EXACTLY this command:
+     node skills/pptx/scripts/create_slides.js slides_content.json --out output.pptx
+  4. Verify: bash output must say "Saved: output.pptx (N slides)".
+  5. Verify content:
+     node -e "const p=require('pptxgenjs'); console.log('pptxgenjs ok')"
+  NEVER create your own create_slides.py. NEVER write .pptx with write_file directly.
+  NEVER mark done unless "Saved:" appears AND verification shows correct slide count.
 
 Skills available:
 {SKILL_LOADER.get_descriptions()}"""
 
 SUBAGENT_SYSTEM = f"""You are a coding subagent at {WORKDIR}. Complete the given task, then summarize your findings.
 Before executing commands, briefly explain what you plan to do and why.
-Think step by step and communicate your reasoning."""
+Think step by step and communicate your reasoning.
+
+PRESENTATION (PPTX) RULES — follow exactly when asked to make slides:
+  1. Call load_skill("pptx") FIRST — read the keyword guide carefully before picking image_keyword values.
+  2. Use write_file to create a JSON content file (e.g. slides_content.json) with:
+     - A meaningful "title" (NOT "Presentation")
+     - The slides array key MUST be "slides" (not "content", not "pages") — e.g. {{"title": "...", "slides": [...]}}
+     - At least 18-20 items in the "slides" array, each with 3-5 bullets (user expects a full, rich presentation)
+     - "image_keyword" should be specific: use real names, places, or events (Chinese OK, e.g. "鄭麗文習近平握手")
+  3. Run EXACTLY this command:
+     node skills/pptx/scripts/create_slides.js slides_content.json --out output.pptx
+  4. Verify success: bash output must say "Saved: output.pptx (N slides)".
+  5. Verify content with:
+     node -e "const p=require('pptxgenjs'); console.log('pptxgenjs ok')"
+  NEVER write a .pptx file directly with write_file — that produces a fake text file, not a real presentation.
+  NEVER create your own create_slides.py.
+  NEVER mark done unless "Saved:" appears in bash output AND verification shows correct slide count."""
 
 
 # ── Context compression ─────────────────────────────────────────────────────────
@@ -192,7 +232,8 @@ def estimate_tokens(messages: list) -> int:
 
 
 def micro_compact(messages: list) -> list:
-    tool_indices = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
+    tool_indices = [i for i, m in enumerate(messages)
+                    if m.get("role") == "tool" and m.get("name") != "load_skill"]
     if len(tool_indices) <= KEEP_RECENT:
         return messages
     to_clear = tool_indices[:-KEEP_RECENT]
@@ -341,6 +382,37 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Error: {e}"
 
 
+# ── Web search tool ───────────────────────────────────────────────────────────────
+def run_web_search(query: str, num_results: int = 5) -> str:
+    api_key = os.environ.get("SERP_API_KEY", "")
+    if not api_key:
+        return "Error: SERP_API_KEY not set in .env"
+    params = urllib.parse.urlencode({
+        "q": query,
+        "api_key": api_key,
+        "num": min(num_results, 10),
+        "hl": "en",
+    })
+    req = urllib.request.Request(
+        f"https://serpapi.com/search.json?{params}",
+        headers={"User-Agent": "Mozilla/5.0"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+        results = []
+        for r in data.get("organic_results", [])[:num_results]:
+            title   = r.get("title", "")
+            link    = r.get("link", "")
+            snippet = r.get("snippet", "")
+            results.append(f"**{title}**\n{link}\n{snippet}")
+        if not results:
+            return f"No results found for: {query}"
+        return "\n\n".join(results)
+    except Exception as e:
+        return f"Error: {e}"
+
+
 TOOL_HANDLERS = {
     "bash":             lambda **kw: run_bash(kw["command"]),
     "read_file":        lambda **kw: run_read(kw["path"], kw.get("limit")),
@@ -350,6 +422,7 @@ TOOL_HANDLERS = {
     "load_skill":       lambda **kw: SKILL_LOADER.get_content(kw["name"]),
     "get_pdf_info":     lambda **kw: run_get_pdf_info(kw["path"]),
     "read_pdf_pages":   lambda **kw: run_read_pdf_pages(kw["path"], kw["pages"]),
+    "web_search":       lambda **kw: run_web_search(kw["query"], kw.get("num_results", 5)),
     "compact":          lambda **kw: "Manual compression requested.",
 }
 
@@ -395,6 +468,14 @@ CHILD_TOOLS = [
             "pages": {"type": "string", "description": "Pages to read, e.g. '1-5', '1,3,10', '42'"}
         }, "required": ["path", "pages"]}
     }},
+    {"type": "function", "function": {
+        "name": "web_search",
+        "description": "Search the web using SerpAPI (Google Search). Returns titles, URLs, and snippets of top results. Use for finding up-to-date information, documentation, or any topic not in local files.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "Search query string"},
+            "num_results": {"type": "integer", "description": "Number of results to return (1-10, default 5)"}
+        }, "required": ["query"]}
+    }},
 ]
 
 PARENT_TOOLS = CHILD_TOOLS + [
@@ -428,15 +509,21 @@ PARENT_TOOLS = CHILD_TOOLS + [
 
 # ── Subagent ─────────────────────────────────────────────────────────────────────
 def run_subagent(prompt: str) -> str:
+    from openai import BadRequestError
     sub_messages = [{"role": "user", "content": prompt}]
     response = None
     for _ in range(30):
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=[{"role": "system", "content": SUBAGENT_SYSTEM}] + sub_messages,
-            tools=CHILD_TOOLS,
-            max_tokens=4000,
-        )
+        try:
+            response = client.chat.completions.create(
+                model=MODEL,
+                messages=[{"role": "system", "content": SUBAGENT_SYSTEM}] + sub_messages,
+                tools=CHILD_TOOLS,
+                max_tokens=16000,
+            )
+        except BadRequestError as e:
+            err = str(e)
+            print(f"  \033[31m[subagent] BadRequestError: {err[:300]}\033[0m")
+            return f"Subagent failed: {err[:500]}"
         msg = response.choices[0].message
         sub_messages.append({"role": "assistant", "content": msg.content, "tool_calls": msg.tool_calls})
         if msg.content:
@@ -471,12 +558,18 @@ def agent_loop(messages: list):
             print("[auto_compact triggered]")
             messages[:] = auto_compact(messages)
 
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=[{"role": "system", "content": SYSTEM}] + messages,
-            tools=PARENT_TOOLS,
-            max_tokens=4000,
-        )
+        from openai import BadRequestError
+        try:
+            response = client.chat.completions.create(
+                model=MODEL,
+                messages=[{"role": "system", "content": SYSTEM}] + messages,
+                tools=PARENT_TOOLS,
+                max_tokens=16000,
+            )
+        except BadRequestError as e:
+            print(f"\033[31m[BadRequestError] {str(e)[:400]}\033[0m")
+            messages.append({"role": "user", "content": f"<error>API error: {str(e)[:300]}. Please adjust your approach and continue.</error>"})
+            continue
         msg = response.choices[0].message
         messages.append({"role": "assistant", "content": msg.content, "tool_calls": msg.tool_calls})
         if msg.content:
@@ -523,6 +616,10 @@ def agent_loop(messages: list):
                 pages_arg = function_args.get("pages", "")
                 preview = str(output)[:200]
                 print(f"> read_pdf_pages ({pages_arg}): {preview}...")
+            elif block.function.name == "web_search":
+                q = function_args.get("query", "")
+                preview = str(output)[:300]
+                print(f"> web_search ({q!r}):\n{preview}...")
             else:
                 print(f"> {block.function.name}: {str(output)[:200]}")
 

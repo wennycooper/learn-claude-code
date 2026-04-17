@@ -58,49 +58,42 @@ Nothing else. No subagents needed.
 ### Step 2 — bash: run the EXISTING script
 
 ```bash
-python skills/pptx/scripts/create_slides.py slides_content.json --out your_output.pptx
+node skills/pptx/scripts/create_slides.js slides_content.json --out your_output.pptx
 ```
 
 Correct output looks like:
 ```
 [title slide] 'Presentation Title'
-  [image] 'dark dramatic sky stars' → Photo by X on Unsplash
-[slide 1] 'First Slide Title' — searching 'mountain lake reflection serene'
-  [image] 'mountain lake reflection serene' → Photo by Y on Unsplash
+  [image] 'dark dramatic sky stars' → via Google / Wikipedia
+[slide 1] 'First Slide Title' — searching '立花瀧 宮水三葉'
+  [image] '立花瀧 宮水三葉' → via Google / Fandom
 Saved: your_output.pptx  (3 slides)
 ```
 
 **"Saved: ..." = success.** The file now contains real images.
 
-### Keyword guide — think like a photographer, not a technical writer
+### Keyword guide — Google Images, use specific terms
 
-Unsplash is a **photo library**, not a diagram library. Keywords must describe
-a real scene that can be photographed. Technical terms like "DDS middleware"
-or "ROS2 architecture" return irrelevant results.
+Images are fetched via **Google Images** (SerpAPI). Keywords can be specific names,
+events, places, or Chinese/Japanese text — Google understands them all.
 
-**Rule**: For each slide, ask "What physical scene or object represents this idea?"
+**Rule**: Be as specific as possible. The more specific the keyword, the more relevant the image.
 
-| Slide topic | BAD keyword ❌ | GOOD keyword ✓ |
-|-------------|--------------|----------------|
-| 機器人系統架構 | "ROS2 architecture" | "industrial robot arm assembly line" |
-| 分散式通訊 DDS | "DDS middleware" | "server room fiber optic cables" |
-| 即時控制 | "real-time system" | "engineer control room multiple screens" |
-| 安全性 Security | "cybersecurity" | "padlock close-up metal security" |
-| 自駕車 | "autonomous vehicle ROS" | "self driving car highway sensors" |
-| 遷移策略 | "migration strategy" | "bridge crossing river construction" |
-| 跨平台支援 | "cross platform" | "multiple computer screens office" |
-| 社群生態 | "open source community" | "people collaborating whiteboard team" |
-| 工業機器人 | "industrial automation" | "robot welding sparks factory floor" |
-| 無人機 Drone | "drone ROS2" | "drone flying aerial photography" |
-| 醫療機器人 | "healthcare robot" | "surgeon operating room precise tools" |
-| 結語/未來 | "future of ROS" | "sunrise horizon road forward journey" |
-| 標題頁 general | "technology" | "dark circuit board blue light" |
+| Slide topic | Generic ❌ | Specific ✓ |
+|-------------|-----------|------------|
+| 鄭麗文訪陸 | "Taiwan politician" | "鄭麗文習近平握手" |
+| 鄭習會 | "meeting" | "鄭麗文習近平人民大會堂" |
+| 十項措施 | "policy document" | "兩岸政策文件 北京" |
+| 中山陵 | "mausoleum" | "中山陵南京" |
+| 機器人架構 | "technology" | "ROS2 robot arm factory" |
+| 自駕車 | "car" | "autonomous vehicle Tesla highway" |
+| 結語/未來 | "future" | "sunrise horizon road" |
 
 **Extra tips:**
-- 2-4 words work best: "robot arm sparks", "server room dark"
-- Add mood words: "dramatic", "close-up", "aerial", "dark moody"
-- Avoid logos, text-heavy scenes, or faces (often not ideal for slides)
-- If first keyword gives poor result, try a more concrete/physical version
+- Chinese keywords work great for Taiwan/China news topics
+- For people: use full name + event (e.g. "鄭麗文 大陸訪問 2025")
+- For places: use landmark name (e.g. "人民大會堂")
+- For abstract topics: use English descriptive phrases
 
 ---
 
